@@ -23,10 +23,10 @@ jobs:
       - name: Compile packrom_unpack for Windows
         run: |
           if [ "${{ matrix.target }}" = "x86_64" ]; then
-            x86_64-w64-mingw32-g++ -O2 -std=c++17 -o packrom_unpack-x64.exe packrom_unpack.cpp
+            x86_64-w64-mingw32-g++ -O2 -std=c++17 -static-libgcc -static-libstdc++ -o packrom_unpack-x64.exe packrom_unpack.cpp
             echo "Built packrom_unpack-x64.exe"
           else
-            i686-w64-mingw32-g++ -O2 -std=c++17 -o packrom_unpack-x86.exe packrom_unpack.cpp
+            i686-w64-mingw32-g++ -O2 -std=c++17 -static-libgcc -static-libstdc++ -o packrom_unpack-x86.exe packrom_unpack.cpp
             echo "Built packrom_unpack-x86.exe"
           fi
 
