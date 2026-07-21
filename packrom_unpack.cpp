@@ -330,7 +330,7 @@ static int pick_stride(const std::vector<uint8_t>& d, size_t dl, uint32_t ds,
     for(int S=3;S<=24;S++){
         std::vector<Prim> pr; size_t endo;
         if(!parse_prims(d,dl,ds,S,pr,endo)) continue;
-        long resid=(long)(dl+ds)-(long)endo; if(resid<0||resid>S) continue;
+        long resid=(long)(dl+ds)-(long)endo; if(resid<0) continue;  // parse_prims already verified tail is zero padding
         long np=(long)pr.size(); long nv=0; for(auto&p:pr) nv+=(long)p.voff.size();
         if(np<1) continue;
         bool better = bestS<0 || resid<bestResid ||
@@ -391,11 +391,111 @@ static void emit_tris3(uint8_t op, const std::vector<Corner>& g,
 }
 static inline float rd_f32(const std::vector<uint8_t>& d,size_t o){ uint32_t w=rd_be32(&d[o]); float f; std::memcpy(&f,&w,4); return std::isfinite(f)&&std::fabs(f)<1e6f? f:0.f; }
 
+// ---- auto-texturing: mesh[i] -> material[i].texIndex -> texture table -> texdesc ----
+// GX texel size per format (bits) for texdesc validation.
+static int gx_bpp_of(uint32_t f){ GXFmt g; return gx_fmt(f,g)? g.bpp:0; }
+static bool valid_texdesc(const std::vector<uint8_t>& d, uint32_t base, size_t td){
+    size_t n=d.size(); if(td+0x30>n) return false;
+    uint16_t h=rd_be16(&d[td]), w=rd_be16(&d[td+2]); uint32_t fmt=rd_be32(&d[td+4]), pd=rd_be32(&d[td+8]);
+    int bpp=gx_bpp_of(fmt); if(!bpp) return false;
+    if(w<4||w>1024||h<4||h>1024) return false;
+    if(!(pd>=base&&pd<base+n)) return false;
+    return (size_t)(pd-base)+(size_t)w*h*bpp/8<=n;
+}
+// Texture tables: maximal runs of (texdesc_ptr, 0). Returns each as a vector of texdesc offsets.
+static std::vector<std::vector<size_t>> find_tex_tables(const std::vector<uint8_t>& d, uint32_t base){
+    size_t n=d.size(); std::vector<std::vector<size_t>> out;
+    for(size_t o=0;o+8<=n;){
+        uint32_t v=rd_be32(&d[o]);
+        if(v>=base&&v<base+n&&rd_be32(&d[o+4])==0&&valid_texdesc(d,base,v-base)){
+            std::vector<size_t> t;
+            while(o+8<=n){ uint32_t a=rd_be32(&d[o]);
+                if(a>=base&&a<base+n&&rd_be32(&d[o+4])==0&&valid_texdesc(d,base,a-base)){ t.push_back(a-base); o+=8; }
+                else break; }
+            out.push_back(std::move(t));
+        } else o+=4;
+    }
+    return out;
+}
+// A material record is 44 bytes: [type:u16 in 2..6][texIndex:u16][RGBA*3][0][f32]...
+// Strict validator against a texture table of `ntex` entries.
+static bool is_mat_record(const std::vector<uint8_t>& d, size_t r, size_t ntex){
+    size_t n=d.size(); if(r+44>n) return false;
+    uint16_t c=rd_be16(&d[r]), ti=rd_be16(&d[r+2]);
+    if(c<2||c>6) return false;
+    if(!(ti==0xFFFF||ti<ntex)) return false;
+    if(rd_be32(&d[r+0x10])!=0) return false;
+    if((rd_be32(&d[r+4])&0xff)!=0xff) return false;   // first material color alpha=255
+    return true;
+}
+// Scan for material arrays (>=4 strict records). Returns (offset,count) pairs, file order.
+static std::vector<std::pair<size_t,size_t>> find_material_arrays(const std::vector<uint8_t>& d, size_t ntex){
+    size_t n=d.size(); std::vector<std::pair<size_t,size_t>> out;
+    for(size_t o=0;o+44<=n;){
+        if(is_mat_record(d,o,ntex)){ size_t s=o,c=0; while(is_mat_record(d,o,ntex)){ o+=44; ++c; }
+            if(c>=4) out.push_back({s,c}); }
+        else o+=4;
+    }
+    return out;
+}
+// Mesh descriptor positions (at dl_size word = record+4), relaxed (any word0). Sorted, deduped.
+static std::vector<size_t> find_mesh_descs(const std::vector<uint8_t>& d, uint32_t base){
+    size_t n=d.size(); std::vector<size_t> offs;
+    for(size_t o=4;o+24<=n;o+=4){
+        uint32_t dls=rd_be32(&d[o]),dl=rd_be32(&d[o+4]),pos=rd_be32(&d[o+8]),nrm=rd_be32(&d[o+12]);
+        if(dls<4||dls>0x200000) continue;
+        if(!(dl>=base&&dl<base+n&&pos>=base&&pos<base+n&&nrm>=base&&nrm<base+n)) continue;
+        if((size_t)(dl-base)+dls>n||!is_prim(d[dl-base]&0xF8)||d[dl-base]==0) continue;
+        bool okf=true; for(int k=0;k<2&&okf;k++){ uint32_t w=rd_be32(&d[pos-base+k*4]); float f; std::memcpy(&f,&w,4);
+            if(!std::isfinite(f)||std::fabs(f)>1e6f) okf=false; }
+        if(okf) offs.push_back(o);
+    }
+    return offs;
+}
+// Build map: mesh geometry-descriptor offset -> assigned texture DATA offset.
+// Pairs each material array (in order) with the next descriptor run(s) of matching total count.
+static std::map<size_t,size_t> build_tex_assignment(const std::vector<uint8_t>& d, uint32_t base){
+    size_t n=d.size(); std::map<size_t,size_t> assign;
+    auto tables=find_tex_tables(d,base); if(tables.empty()) return assign;
+    const std::vector<size_t>* T=&tables[0]; for(auto&t:tables) if(t.size()>T->size()) T=&t;
+    auto mats=find_material_arrays(d,T->size()); if(mats.empty()) return assign;
+    auto descs=find_mesh_descs(d,base);
+    // group descriptors into runs spaced exactly 28
+    std::vector<std::vector<size_t>> runs; 
+    for(size_t i=0;i<descs.size();){ std::vector<size_t> r{descs[i]}; size_t j=i+1;
+        while(j<descs.size()&&descs[j]-descs[j-1]==28){ r.push_back(descs[j]); ++j; } runs.push_back(r); i=j; }
+    auto do_assign=[&](size_t descoff,uint16_t ti){ if(ti!=0xFFFF&&ti<T->size()){ size_t td=(*T)[ti];
+        uint32_t pd=rd_be32(&d[td+8]); if(pd>=base&&pd<base+n) assign[descoff]=pd-base; } };
+    // Strategy 1: a run whose length equals a material array's count -> direct pair (single-object common case)
+    std::vector<bool> matused(mats.size(),false), runused(runs.size(),false);
+    for(size_t ri=0;ri<runs.size();++ri) for(size_t mi=0;mi<mats.size();++mi){
+        if(matused[mi]) continue;
+        if(runs[ri].size()==mats[mi].second){
+            for(size_t k=0;k<mats[mi].second;k++) do_assign(runs[ri][k],rd_be16(&d[mats[mi].first+k*44+2]));
+            matused[mi]=runused[ri]=true; break;
+        }
+    }
+    // Strategy 2: for still-unused material arrays, consume consecutive unused runs (file order) until counts match
+    size_t ri=0;
+    for(size_t mi=0;mi<mats.size();++mi){ if(matused[mi]) continue;
+        size_t need=mats[mi].second; std::vector<size_t> chosen;
+        while(ri<runs.size()&&(runused[ri]||chosen.size()<need)){
+            if(runused[ri]){ ++ri; continue; }
+            for(size_t x:runs[ri]) chosen.push_back(x); runused[ri]=true; ++ri;
+            if(chosen.size()>=need) break;
+        }
+        if(chosen.size()==need) for(size_t k=0;k<need;k++) do_assign(chosen[k],rd_be16(&d[mats[mi].first+k*44+2]));
+    }
+    return assign;
+}
+
 // Scan the whole image for mesh descriptors and write one combined OBJ (+MTL).
 // Uses the GX attribute order (Table 1): matrix indices (u8) precede POS, NRM,
 // CLR, TEX0 (index16). Positions/normals are F32 XYZ; texcoords F32 ST.
 static void export_obj(const std::vector<uint8_t>& d, uint32_t base, const fs::path& path,
-                       const fs::path& mtlname, const std::string& tex_material,
+                       const fs::path& mtlname, bool has_mtl,
+                       const std::map<size_t,size_t>& tex_assign,
+                       const std::map<size_t,std::string>& tex_by_dataoff,
                        size_t& outV, size_t& outF, size_t& outM){
     const size_t n=d.size();
     std::vector<std::array<float,3>> P, N;
@@ -458,14 +558,19 @@ static void export_obj(const std::vector<uint8_t>& d, uint32_t base, const fs::p
     f<<"# extracted by packrom_unpack from a GameCube GX resource image\n";
     f<<"# "<<P.size()<<" positions, "<<T.size()<<" texcoords, "<<N.size()<<" normals, "
      <<faces.size()<<" faces, "<<nmesh<<" meshes\n";
-    if(!tex_material.empty()) f<<"mtllib "<<mtlname.filename().string()<<"\n";
+    if(has_mtl) f<<"mtllib "<<mtlname.filename().string()<<"\n";
     for(auto&v:P){ char b[64]; std::snprintf(b,sizeof b,"v %.5f %.5f %.5f\n",v[0],v[1],v[2]); f<<b; }
     for(auto&t:T){ char b[48]; std::snprintf(b,sizeof b,"vt %.5f %.5f\n",t[0],t[1]); f<<b; }
     for(auto&v:N){ char b[64]; std::snprintf(b,sizeof b,"vn %.5f %.5f %.5f\n",v[0],v[1],v[2]); f<<b; }
-    if(!tex_material.empty()) f<<"usemtl "<<tex_material<<"\n";
     size_t gi=0;
     for(size_t i=0;i<faces.size();i++){
-        while(gi<groups.size()&&groups[gi].first==i){ f<<"g mesh_"<<gi<<"_0x"<<std::hex<<groups[gi].second<<std::dec<<"\n"; ++gi; }
+        while(gi<groups.size()&&groups[gi].first==i){
+            f<<"g mesh_"<<gi<<"_0x"<<std::hex<<groups[gi].second<<std::dec<<"\n";
+            auto it=tex_assign.find(groups[gi].second);          // descriptor offset
+            if(it!=tex_assign.end()){ auto p=tex_by_dataoff.find(it->second);
+                if(p!=tex_by_dataoff.end()){ char m[32]; std::snprintf(m,sizeof m,"mtl_0x%zx",it->second); f<<"usemtl "<<m<<"\n"; } }
+            ++gi;
+        }
         f<<"f";
         for(int k=0;k<3;k++){ const Corner&c=faces[i][k]; f<<" "<<c.p;
             if(c.t||c.n){ f<<"/"; if(c.t)f<<c.t; f<<"/"; if(c.n)f<<c.n; } }
@@ -528,7 +633,11 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
     size_t ntex=0;
     std::string biggest_png; uint32_t biggest_area=0;
     std::vector<std::string> all_png;   // every decoded texture (relative path)
+    std::map<size_t,std::string> tex_by_dataoff;  // texture data offset -> relative png
     if(opt.write_textures){
+        // texture-table-referenced descriptors are guaranteed real -> allow even if NPOT
+        std::set<size_t> table_descs;
+        for(auto&t:find_tex_tables(d,base)) for(size_t td:t) table_descs.insert(td);
         std::ofstream tix; bool opened=false; std::set<size_t> done;
         for(size_t o=0;o+0x30<=n;o+=4){
             // TEXHeader field order is [height][width] (Nintendo CharPipeline SDK).
@@ -536,7 +645,7 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
             uint32_t fmt=rd_be32(&d[o+4]), pd=rd_be32(&d[o+8]);
             GXFmt gf; if(!gx_fmt(fmt,gf)) continue;
             if(w<1||h<1||w>1024||h>1024) continue;
-            if(!(opt.allow_npot||(is_pow2(w)&&is_pow2(h)))) continue;
+            if(!(opt.allow_npot||(is_pow2(w)&&is_pow2(h))||table_descs.count(o))) continue;
             if(!(pd>=base&&pd<base+n)) continue;
             size_t data=pd-base; size_t need=(size_t)w*h*gf.bpp/8;
             if(data+need>n) continue;
@@ -558,6 +667,7 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
                                        ntex,(size_t)data,gf.name,(int)w,(int)h);
             write_png(out/"textures"/nm,img,w,h);
             std::string rel=std::string("textures/")+nm; all_png.push_back(rel);
+            tex_by_dataoff[data]=rel;
             if((uint32_t)w*h>biggest_area){ biggest_area=(uint32_t)w*h; biggest_png=rel; }
             // wrap/filter from CharPipeline TEXHeader fields (0=CLAMP/NEAR,1=REPEAT/LINEAR,2=MIRROR)
             static const char* WM[]={"CLAMP","REPEAT","MIRROR"};
@@ -602,22 +712,20 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
     // ------------------------------------------------------------------ OBJ EXPORT
     size_t objV=0,objF=0,objM=0;
     if(opt.write_obj){
-        std::string material; fs::path mtlpath=out/(stem.string()+".mtl");
-        if(!all_png.empty()){
-            material="tex_default";
+        std::map<size_t,size_t> tex_assign = build_tex_assignment(d,base);
+        fs::path mtlpath=out/(stem.string()+".mtl");
+        bool has_mtl=!tex_by_dataoff.empty();
+        if(has_mtl){
             std::ofstream mf(mtlpath);
-            mf<<"# One material per decoded texture in this file. GX meshes here bind\n";
-            mf<<"# their texture through a material/draw layer that isn't fully mapped,\n";
-            mf<<"# so every mesh is assigned 'tex_default' (the largest texture) and the\n";
-            mf<<"# UVs are exported correctly -- reassign a material below per 'g' group.\n\n";
-            auto emit=[&](const std::string& name,const std::string& png){
-                mf<<"newmtl "<<name<<"\nKa 1 1 1\nKd 1 1 1\nd 1\nillum 1\nmap_Kd "<<png<<"\n\n"; };
-            emit(material,biggest_png);
-            for(size_t i=0;i<all_png.size();++i){
-                char mn[32]; std::snprintf(mn,sizeof mn,"tex_%zu",i); emit(mn,all_png[i]);
+            mf<<"# One material per decoded texture, named by its data offset.\n";
+            mf<<"# Meshes are auto-assigned via material.texIndex -> texture table;\n";
+            mf<<"# vertex-colored meshes get no usemtl. UVs are exported correctly.\n\n";
+            for(auto&kv:tex_by_dataoff){
+                char mn[32]; std::snprintf(mn,sizeof mn,"mtl_0x%zx",kv.first);
+                mf<<"newmtl "<<mn<<"\nKa 1 1 1\nKd 1 1 1\nd 1\nillum 1\nmap_Kd "<<kv.second<<"\n\n";
             }
         }
-        export_obj(d,base,out/(stem.string()+".obj"),mtlpath,material,objV,objF,objM);
+        export_obj(d,base,out/(stem.string()+".obj"),mtlpath,has_mtl,tex_assign,tex_by_dataoff,objV,objF,objM);
         if(objM==0){ std::error_code ec; fs::remove(out/(stem.string()+".obj"),ec); fs::remove(mtlpath,ec); }
     }
 
