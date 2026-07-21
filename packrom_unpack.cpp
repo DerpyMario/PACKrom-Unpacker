@@ -525,10 +525,12 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
     // ------------------------------------------------------------------ TEXTURES
     size_t ntex=0;
     std::string biggest_png; uint32_t biggest_area=0;
+    std::vector<std::string> all_png;   // every decoded texture (relative path)
     if(opt.write_textures){
         std::ofstream tix; bool opened=false; std::set<size_t> done;
         for(size_t o=0;o+0x30<=n;o+=4){
-            uint16_t w=rd_be16(&d[o]), h=rd_be16(&d[o+2]);
+            // TEXHeader field order is [height][width] (Nintendo CharPipeline SDK).
+            uint16_t h=rd_be16(&d[o]), w=rd_be16(&d[o+2]);
             uint32_t fmt=rd_be32(&d[o+4]), pd=rd_be32(&d[o+8]);
             GXFmt gf; if(!gx_fmt(fmt,gf)) continue;
             if(w<1||h<1||w>1024||h>1024) continue;
@@ -553,7 +555,8 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
             char nm[96]; std::snprintf(nm,sizeof nm,"tex_%04zu_0x%06zx_%s_%dx%d.png",
                                        ntex,(size_t)data,gf.name,(int)w,(int)h);
             write_png(out/"textures"/nm,img,w,h);
-            if((uint32_t)w*h>biggest_area){ biggest_area=(uint32_t)w*h; biggest_png=std::string("textures/")+nm; }
+            std::string rel=std::string("textures/")+nm; all_png.push_back(rel);
+            if((uint32_t)w*h>biggest_area){ biggest_area=(uint32_t)w*h; biggest_png=rel; }
             tix<<nm<<"  0x"<<std::hex<<o<<"  0x"<<data<<std::dec<<"  "<<gf.name
                <<"  "<<w<<"  "<<h<<"  "<<need<<"\n";
             done.insert(data); ++ntex;
@@ -590,13 +593,19 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
     size_t objV=0,objF=0,objM=0;
     if(opt.write_obj){
         std::string material; fs::path mtlpath=out/(stem.string()+".mtl");
-        if(!biggest_png.empty()){
+        if(!all_png.empty()){
             material="tex_default";
             std::ofstream mf(mtlpath);
-            mf<<"# material references the largest decoded texture in this file.\n";
-            mf<<"# GX meshes don't carry an explicit texture id here, so reassign per\n";
-            mf<<"# mesh in your 3D tool if needed; UVs are exported correctly.\n";
-            mf<<"newmtl "<<material<<"\nKa 1 1 1\nKd 1 1 1\nd 1\nillum 1\nmap_Kd "<<biggest_png<<"\n";
+            mf<<"# One material per decoded texture in this file. GX meshes here bind\n";
+            mf<<"# their texture through a material/draw layer that isn't fully mapped,\n";
+            mf<<"# so every mesh is assigned 'tex_default' (the largest texture) and the\n";
+            mf<<"# UVs are exported correctly -- reassign a material below per 'g' group.\n\n";
+            auto emit=[&](const std::string& name,const std::string& png){
+                mf<<"newmtl "<<name<<"\nKa 1 1 1\nKd 1 1 1\nd 1\nillum 1\nmap_Kd "<<png<<"\n\n"; };
+            emit(material,biggest_png);
+            for(size_t i=0;i<all_png.size();++i){
+                char mn[32]; std::snprintf(mn,sizeof mn,"tex_%zu",i); emit(mn,all_png[i]);
+            }
         }
         export_obj(d,base,out/(stem.string()+".obj"),mtlpath,material,objV,objF,objM);
         if(objM==0){ std::error_code ec; fs::remove(out/(stem.string()+".obj"),ec); fs::remove(mtlpath,ec); }
