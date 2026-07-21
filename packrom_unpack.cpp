@@ -186,7 +186,9 @@ static bool gx_decode(const std::vector<uint8_t>& d, size_t off, int w, int h,
                 for(int k=0;k<3;k++){ col[2][k]=(2*col[0][k]+col[1][k])/3; col[3][k]=(col[0][k]+2*col[1][k])/3; }
                 col[2][3]=col[3][3]=255;
             } else {
-                for(int k=0;k<3;k++){ col[2][k]=(col[0][k]+col[1][k])/2; col[3][k]=0; }
+                // punchthrough (c0<=c1): color2 = average opaque, color3 = same average
+                // but transparent (matches Dolphin/GC hardware, not PC DXT1's black).
+                for(int k=0;k<3;k++){ int avg=(col[0][k]+col[1][k])/2; col[2][k]=avg; col[3][k]=avg; }
                 col[2][3]=255; col[3][3]=0;
             }
             for(int yy=0;yy<4;yy++) for(int xx=0;xx<4;xx++){
@@ -551,14 +553,22 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
             if(!gx_decode(d,data,w,h,fmt,palfmt,palo,havePal,img)) continue;
             if(!opened){ fs::create_directories(out/"textures");
                 tix.open(out/"textures"/"index.txt");
-                tix<<"# png  desc_off  data_off  format  w  h  bytes\n"; opened=true; }
+                tix<<"# png  desc_off  data_off  format  w  h  bytes  wrapS  wrapT  minFilt  magFilt\n"; opened=true; }
             char nm[96]; std::snprintf(nm,sizeof nm,"tex_%04zu_0x%06zx_%s_%dx%d.png",
                                        ntex,(size_t)data,gf.name,(int)w,(int)h);
             write_png(out/"textures"/nm,img,w,h);
             std::string rel=std::string("textures/")+nm; all_png.push_back(rel);
             if((uint32_t)w*h>biggest_area){ biggest_area=(uint32_t)w*h; biggest_png=rel; }
+            // wrap/filter from CharPipeline TEXHeader fields (0=CLAMP/NEAR,1=REPEAT/LINEAR,2=MIRROR)
+            static const char* WM[]={"CLAMP","REPEAT","MIRROR"};
+            static const char* FM[]={"NEAR","LINEAR"};
+            uint32_t ws=rd_be32(&d[o+0x0c]), wt=rd_be32(&d[o+0x10]),
+                     mnf=rd_be32(&d[o+0x14]), mgf=rd_be32(&d[o+0x18]);
+            auto wm=[&](uint32_t v){ return v<3?WM[v]:"?"; };
+            auto fm=[&](uint32_t v){ return v<2?FM[v]:"?"; };
             tix<<nm<<"  0x"<<std::hex<<o<<"  0x"<<data<<std::dec<<"  "<<gf.name
-               <<"  "<<w<<"  "<<h<<"  "<<need<<"\n";
+               <<"  "<<w<<"  "<<h<<"  "<<need
+               <<"  "<<wm(ws)<<"  "<<wm(wt)<<"  "<<fm(mnf)<<"  "<<fm(mgf)<<"\n";
             done.insert(data); ++ntex;
         }
     }
