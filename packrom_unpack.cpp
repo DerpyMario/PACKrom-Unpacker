@@ -594,6 +594,31 @@ struct Options {
 };
 static bool is_pow2(uint32_t x){ return x&&((x&(x-1))==0); }
 
+// Map a PACK stem to a nested output path, e.g.
+//   ITEM_FIGURE_MICKEY_PACK -> item/figure/mickey   (leaf = "mickey")
+//   BALL0_PACK              -> ball/0                (leaf = "0")
+//   DVD_ERR_FR_PACK         -> dvd/err/fr            (leaf = "fr")
+// Rule: strip a trailing "_PACK", lowercase, split on '_' and at every
+// letter<->digit boundary, and join the tokens as directories.
+static fs::path stem_to_path(std::string s, std::string& leaf){
+    auto lower=[](std::string& x){ for(char& c:x) c=(char)std::tolower((unsigned char)c); };
+    lower(s);
+    if(s.size()>=5 && s.compare(s.size()-5,5,"_pack")==0) s.resize(s.size()-5);
+    std::vector<std::string> toks; std::string cur; int mode=0; // 1=alpha 2=digit
+    auto flush=[&]{ if(!cur.empty()){ toks.push_back(cur); cur.clear(); } };
+    for(unsigned char c: s){
+        int m = std::isdigit(c)?2 : (std::isalpha(c)?1:0);
+        if(m==0){ flush(); mode=0; continue; }          // '_' or other -> separator
+        if(mode && m!=mode) flush();                     // letter<->digit boundary
+        cur.push_back((char)c); mode=m;
+    }
+    flush();
+    fs::path p; for(auto& t:toks) p/=t;
+    leaf = toks.empty()? std::string("out") : toks.back();
+    if(p.empty()) p=leaf;
+    return p;
+}
+
 // ==========================================================================
 //  per-file unpack
 // ==========================================================================
@@ -610,13 +635,14 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
         if(w>=base&&w<base+n){ sites.push_back(o); targets.insert(w-base); } }
     targets.insert(0);
 
-    fs::path stem=in_path.stem(); fs::path out=opt.outdir/stem;
+    std::string leaf;
+    fs::path out=opt.outdir/stem_to_path(in_path.stem().string(),leaf);
     fs::create_directories(out);
 
     // relocated copy
     std::vector<uint8_t> reloc=d;
     for(size_t o:sites){ uint32_t w=rd_be32(&d[o]); wr_be32(&reloc[o],(w-base)+opt.rebase); }
-    write_file(out/(stem.string()+".unpacked.bin"),reloc.data(),reloc.size());
+    write_file(out/(leaf+".unpacked.bin"),reloc.data(),reloc.size());
 
     // blocks
     std::vector<uint32_t> tv(targets.begin(),targets.end()); std::sort(tv.begin(),tv.end());
@@ -713,7 +739,7 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
     size_t objV=0,objF=0,objM=0;
     if(opt.write_obj){
         std::map<size_t,size_t> tex_assign = build_tex_assignment(d,base);
-        fs::path mtlpath=out/(stem.string()+".mtl");
+        fs::path mtlpath=out/(leaf+".mtl");
         bool has_mtl=!tex_by_dataoff.empty();
         if(has_mtl){
             std::ofstream mf(mtlpath);
@@ -725,8 +751,8 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
                 mf<<"newmtl "<<mn<<"\nKa 1 1 1\nKd 1 1 1\nd 1\nillum 1\nmap_Kd "<<kv.second<<"\n\n";
             }
         }
-        export_obj(d,base,out/(stem.string()+".obj"),mtlpath,has_mtl,tex_assign,tex_by_dataoff,objV,objF,objM);
-        if(objM==0){ std::error_code ec; fs::remove(out/(stem.string()+".obj"),ec); fs::remove(mtlpath,ec); }
+        export_obj(d,base,out/(leaf+".obj"),mtlpath,has_mtl,tex_assign,tex_by_dataoff,objV,objF,objM);
+        if(objM==0){ std::error_code ec; fs::remove(out/(leaf+".obj"),ec); fs::remove(mtlpath,ec); }
     }
 
     // strings
