@@ -143,6 +143,19 @@ static bool gx_fmt(uint32_t f, GXFmt& o){
         default: return false;
     }
 }
+// TEXHeader +0x24 (u16) is the CLUT entry count: 16 (C4), 256 (C8), 16384 (C14X2),
+// 0xFFFF for non-paletted formats. Combined with tile-alignment this reliably
+// identifies non-power-of-two textures (jersey numbers, banners, full-screen art)
+// that a pow2-only scan would miss.
+static bool npot_texdesc_ok(const std::vector<uint8_t>& d, size_t o,
+                            uint32_t w, uint32_t h, uint32_t fmt, const GXFmt& gf){
+    if(w%(uint32_t)gf.tw || h%(uint32_t)gf.th) return false;   // must tile exactly
+    uint16_t pc=rd_be16(&d[o+0x24]);
+    if(fmt==8)  return pc==16;
+    if(fmt==9)  return pc==256;
+    if(fmt==10) return pc==16384;
+    return pc==0xFFFF;
+}
 static inline int c4to8(int v){ return (v<<4)|v; }
 static inline int c3to8(int v){ return (v<<5)|(v<<2)|(v>>1); }
 static inline int c5to8(int v){ return (v<<3)|(v>>2); }
@@ -671,7 +684,8 @@ static void unpack_one(const fs::path& in_path, const Options& opt){
             uint32_t fmt=rd_be32(&d[o+4]), pd=rd_be32(&d[o+8]);
             GXFmt gf; if(!gx_fmt(fmt,gf)) continue;
             if(w<1||h<1||w>1024||h>1024) continue;
-            if(!(opt.allow_npot||(is_pow2(w)&&is_pow2(h))||table_descs.count(o))) continue;
+            if(!(opt.allow_npot||(is_pow2(w)&&is_pow2(h))||table_descs.count(o)
+                 ||npot_texdesc_ok(d,o,w,h,fmt,gf))) continue;
             if(!(pd>=base&&pd<base+n)) continue;
             size_t data=pd-base; size_t need=(size_t)w*h*gf.bpp/8;
             if(data+need>n) continue;
